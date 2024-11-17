@@ -82,7 +82,7 @@ impl LanguageServer for Backend {
         self.client
             .log_message(MessageType::INFO, "file opened!")
             .await;
-        let rope = ropey::Rope::from_str(&params.text_document.text);
+        let rope = Rope::from_str(&params.text_document.text);
         self.document_map
             .lock()
             .await
@@ -131,13 +131,11 @@ impl LanguageServer for Backend {
             .log_message(MessageType::INFO, "completion!")
             .await;
         let uri = params.text_document_position.text_document.uri;
-
         let document_map = self.document_map.lock().await;
         let position = params.text_document_position.position;
         let rope = document_map.get(&uri.to_string()).unwrap();
         let line_start = rope.line_to_char(position.line as usize);
         let offset = line_start + position.character as usize;
-
         let line_until_cursor = rope.slice(line_start..offset);
 
         let Some(dir_path) = get_path_suffix(line_until_cursor, false).and_then(|matched_path| {
@@ -150,15 +148,14 @@ impl LanguageServer for Backend {
             } else {
                 Path::new(&*matched_path).into()
             };
-            let path = expand(&path);
+            let path = expand_tilde(path);
             let parent_dir = uri.to_file_path().unwrap();
             let parent_dir = parent_dir.parent();
             let path = match parent_dir {
                 Some(parent_dir) if path.is_relative() => parent_dir.join(&path),
                 _ => path.into_owned(),
             };
-            let ends_with_slash = matches!(matched_path.as_bytes().last(), Some(b'/' | b'\\'));
-            if ends_with_slash {
+            if matched_path.ends_with("/") {
                 Some(PathBuf::from(path.as_path()))
             } else {
                 path.parent().map(PathBuf::from)
@@ -229,63 +226,31 @@ fn read_dir_sorted(path: &Path, show_hidden: bool) -> std::io::Result<Vec<DirEnt
     Ok(entries)
 }
 
-fn path_component_regex(windows: bool) -> String {
-    // TODO: support backslash path escape on windows (when using git bash for example)
-    let space_escape = if windows { r"[\^`]\s" } else { r"[\\]\s" };
-    // partially baesd on what's allowed in an url but with some care to avoid
-    // false positivies (like any kind of brackets or quotes)
-    r"[\w@.\-+#$%?!,;~&]|".to_owned() + space_escape
-}
-
-/// Regex for delimited environment captures like `${HOME}`.
-fn braced_env_regex(windows: bool) -> String {
-    r"\$\{(?:".to_owned() + &path_component_regex(windows) + r"|[/:=])+\}"
-}
-
-fn compile_path_regex(
-    prefix: &str,
-    postfix: &str,
-    match_single_file: bool,
-    windows: bool,
-) -> Regex {
-    let first_component = format!(
-        "(?:{}|(?:{}))",
-        braced_env_regex(windows),
-        path_component_regex(windows)
-    );
+fn compile_path_regex(prefix: &str, postfix: &str, match_single_file: bool) -> Regex {
+    let first_component = r"(?:[\w@.\-+#$%?!,;~&]|[\^`]\s)".to_owned();
     // For all components except the first we allow an equals so that `foo=/
     // bar/baz` does not include foo. This is primarily intended for url queries
     // (where an equals is never in the first component)
     let component = format!("(?:{first_component}|=)");
-    let sep = if windows { r"[/\\]" } else { "/" };
     let url_prefix = r"[\w+\-.]+://??";
-    let path_prefix = if windows {
-        // single slash handles most windows prefixes (like\\server\...) but `\
-        // \?\C:\..` (and C:\) needs special handling, since we don't allow : in path
-        // components (so that colon separated paths and <path>:<line> work)
-        r"\\\\\?\\\w:|\w:|\\|"
-    } else {
-        ""
-    };
-    let path_start = format!("(?:{first_component}+|~|{path_prefix}{url_prefix})");
+    let path_start = format!("(?:{first_component}+|~|{url_prefix})");
     let optional = if match_single_file {
         format!("|{path_start}")
     } else {
         String::new()
     };
-    let path_regex = format!(
-        "{prefix}(?:{path_start}?(?:(?:{sep}{component}+)+{sep}?|{sep}){optional}){postfix}"
-    );
+    let path_regex =
+        format!("{prefix}(?:{path_start}?(?:(?:/{component}+)+/?|/){optional}){postfix}");
     Regex::new(&path_regex).unwrap()
 }
 
 /// If `src` ends with a path then this function returns the part of the slice.
-pub fn get_path_suffix(src: RopeSlice<'_>, match_single_file: bool) -> Option<RopeSlice<'_>> {
+fn get_path_suffix(src: RopeSlice<'_>, match_single_file: bool) -> Option<RopeSlice<'_>> {
     let regex = if match_single_file {
-        static REGEX: Lazy<Regex> = Lazy::new(|| compile_path_regex("", "$", true, cfg!(windows)));
+        static REGEX: Lazy<Regex> = Lazy::new(|| compile_path_regex("", "$", true));
         &*REGEX
     } else {
-        static REGEX: Lazy<Regex> = Lazy::new(|| compile_path_regex("", "$", false, cfg!(windows)));
+        static REGEX: Lazy<Regex> = Lazy::new(|| compile_path_regex("", "$", false));
         &*REGEX
     };
 
@@ -294,31 +259,10 @@ pub fn get_path_suffix(src: RopeSlice<'_>, match_single_file: bool) -> Option<Ro
         .map(|mat| src.byte_slice(mat.range()))
 }
 
-/// Returns an iterator of the **byte** ranges in src that contain a path.
-pub fn find_paths(
-    src: RopeSlice<'_>,
-    match_single_file: bool,
-) -> impl Iterator<Item = std::ops::Range<usize>> + '_ {
-    let regex = if match_single_file {
-        static REGEX: Lazy<Regex> = Lazy::new(|| compile_path_regex("", "", true, cfg!(windows)));
-        &*REGEX
-    } else {
-        static REGEX: Lazy<Regex> = Lazy::new(|| compile_path_regex("", "", false, cfg!(windows)));
-        &*REGEX
-    };
-    regex.find_iter(Input::new(src)).map(|mat| mat.range())
-}
-
-/// Performs substitution of `~` and environment variables, see [`env::expand`](crate::env::expand) and [`expand_tilde`]
-pub fn expand<T: AsRef<Path> + ?Sized>(path: &T) -> Cow<'_, Path> {
-    let path = path.as_ref();
-    expand_tilde(path)
-}
-
 /// Expands tilde `~` into users home directory if available, otherwise returns the path
 /// unchanged. The tilde will only be expanded when present as the first component of the path
 /// and only slash follows it.
-pub fn expand_tilde<'a, P>(path: P) -> Cow<'a, Path>
+fn expand_tilde<'a, P>(path: P) -> Cow<'a, Path>
 where
     P: Into<Cow<'a, Path>>,
 {
@@ -326,7 +270,8 @@ where
     let mut components = path.components();
     if let Some(Component::Normal(c)) = components.next() {
         if c == "~" {
-            if let Ok(mut buf) = etcetera::home_dir() {
+            if let Ok(buf) = std::env::var("HOME") {
+                let mut buf = PathBuf::from(buf);
                 buf.push(components);
                 return Cow::Owned(buf);
             }
